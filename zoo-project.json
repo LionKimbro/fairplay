@@ -1,0 +1,21 @@
+{
+  "zookeep-project-guid": "4c2dacfa-5ca9-41ae-ae71-83765b9d9c75",
+  "name": "fairplay",
+  "repo-type": "python-2026-03",
+  "license": "CC0-1.0",
+  "repository": {
+    "name": "fairplay",
+    "visibility": "public"
+  },
+  "python": {
+    "distribution": {
+      "name": "fairplay"
+    },
+    "import-packages": [
+      {
+        "name": "fairplay",
+        "path": "src/fairplay"
+      }
+    ]
+  }
+}
