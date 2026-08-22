@@ -1,0 +1,164 @@
+{
+  "purpose": "fairplay, as specified in documents docs/raw/01xx",
+  "options": {
+    "encourage-questions": false,
+    "request-ack": true
+  },
+  "documents": {
+    "general-background": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this for high-level orientation to Lion's recurring concepts, systems, and vocabulary."
+    },
+    "general-background-abbreviated": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this for an abbreviated high-level orientation to Lion's recurring concepts, systems, and vocabulary."
+    },
+    "project-directory-system": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this for a brief overview of how Lion's projects and repositories are organized."
+    },
+    "programming-guidelines": {
+      "selected": false,
+      "designation": "required",
+      "reason": "These are the programming guidelines that you shall implement the program with."
+    },
+    "style-card-globals": {
+      "selected": true,
+      "designation": "required",
+      "reason": "Program with this philosophy of Globals."
+    },
+    "style-card-function-names": {
+      "selected": true,
+      "designation": "required",
+      "reason": "When creating functions, name them like this."
+    },
+    "style-card-function-args": {
+      "selected": true,
+      "designation": "required",
+      "reason": "When creating functions, create their parameter lists like this."
+    },
+    "style-card-machines": {
+      "selected": true,
+      "designation": "required",
+      "reason": "Program like you are making little Machines, not abstractions."
+    },
+    "style-card-registers": {
+      "selected": true,
+      "designation": "required",
+      "reason": "Here is how to use registers in the machines you write."
+    },
+    "style-card-python": {
+      "selected": true,
+      "designation": "required",
+      "reason": "These are the broad things to hold in mind when writing Python programs for Lion."
+    },
+    "bad-method": {
+      "selected": false,
+      "designation": "required",
+      "reason": "The development process we will use to meet our goal."
+    },
+    "json-document-writing": {
+      "selected": false,
+      "designation": "recommended",
+      "reason": "Read this when writing JSON documents intended for Lion's systems or for LLM consumption."
+    },
+    "json-document-writing-minimal": {
+      "selected": false,
+      "designation": "recommended",
+      "reason": "A condensed version of the JSON documentation-writing guide; read this for the essentials when the full guide is more than you need."
+    },
+    "softspec-v3": {
+      "selected": false,
+      "designation": "recommended",
+      "reason": "Read this when specifying data structures in JSON documents; SoftSpec is the preferred approach."
+    },
+    "lionscliapp": {
+      "selected": false,
+      "designation": "required",
+      "reason": "The program you are implementing will be built with the lionscliapp framework. Read this so that you know how to use it."
+    },
+    "machine-root": {
+      "selected": true,
+      "designation": "required",
+      "reason": "Read this when the application needs to resolve named machine-local resources through Machine Root."
+    },
+    "tkinter-conventions": {
+      "selected": false,
+      "designation": "required",
+      "reason": "When you write tkinter user interfaces, follow these guidelines."
+    },
+    "tkintertester-reference": {
+      "selected": false,
+      "designation": "required",
+      "reason": "When you write Tkinter GUI tests, use tkintertester. Read this so that you understand the harness, its event-loop-native test model, and its rules."
+    },
+    "tkintertester-lionscliapp": {
+      "selected": false,
+      "designation": "required",
+      "reason": "When you combine tkintertester with lionscliapp, follow this integration pattern so the CLI lifecycle and Tk test lifecycle stay correctly separated."
+    },
+    "tkmachina": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Explains how to use tkMachina, a Little Castles system for making tkinter applications"
+    },
+    "tkvillage-manual-v1": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Explains how to use TkVillage, a lightweight procedural Tkinter host runtime."
+    },
+    "tkvillage-api-v1": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Provide a full user-facing API reference for the current TkVillage kernel."
+    },
+    "tkvillage-data-dictionary-v1": {
+      "selected": false,
+      "designation": "recommended",
+      "reason": "Document the runtime data owned by src/tkvillage/app.py using SoftSpec v3, including structural schemas and data-dictionary annotations for runtime ownership, lifecycle, reset behavior, and serialization boundaries."
+    },
+    "m1-core": {
+      "selected": false,
+      "designation": "required",
+      "reason": "You are going to be handling M1 data. Read this so that you understand the core structure and behavior of M1 entities and aspects."
+    },
+    "m1-core-brief": {
+      "selected": false,
+      "designation": "required",
+      "reason": "You are going to be handling M1 data. Read this so that you understand the core structure and behavior of M1 entities and aspects."
+    },
+    "m1-transport": {
+      "selected": false,
+      "designation": "required",
+      "reason": "You are going to be storing or exchanging M1 data. Read this so that you understand its transport representation."
+    },
+    "m1-link-types": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this when choosing link types for relationships in M1 data."
+    },
+    "m1-merging": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this when combining M1 transport units or reasoning about merge behavior."
+    },
+    "m1-runtime": {
+      "selected": false,
+      "designation": "required",
+      "reason": "Read this so that you know how to use the M1 runtime."
+    },
+    "reducer-core-architecture": {
+      "selected": false,
+      "designation": "required",
+      "reason": "The program will use the Reducer-Core Architecture. Read this to understand the architecture and its specific terms of use."
+    },
+    "cira": {
+      "selected": false,
+      "designation": "required",
+      "reason": "The program is likely to use, or may be required to use, the Coordinated Interactive Runtime Architecture (CIRA). Read this so that you know how to implement it."
+    }
+  }
+}
