@@ -159,12 +159,13 @@ def _find_argument_problems(definition: dict[str, Any]) -> list[str]:
     if flags.arg != "flags":
         return ["three-argument functions need flags as their final argument"]
     if not _is_optional_string_flags_argument(flags, arguments):
-        return ["flags must be annotated list[str] | None and default to None"]
+        return ["flags must default to None and, when annotated, use list[str] | None"]
     return []
 
 
 def _is_optional_string_flags_argument(argument: ast.arg, arguments: ast.arguments) -> bool:
-    return _is_optional_list_of_strings(argument.annotation) and _has_flags_defaulting_to_none(argument, arguments)
+    annotation_is_valid = argument.annotation is None or _is_optional_list_of_strings(argument.annotation)
+    return annotation_is_valid and _has_flags_defaulting_to_none(argument, arguments)
 
 
 def _is_optional_list_of_strings(annotation: ast.expr | None) -> bool:

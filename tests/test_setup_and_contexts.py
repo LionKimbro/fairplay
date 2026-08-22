@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import math
 
 import pytest
 
@@ -25,3 +26,12 @@ def test_contexts():
     assert first["session_guid"] == second["session_guid"]
     assert first["operation_guid"] != second["operation_guid"]
     assert first["config"]["retry_max_attempts"] == 5
+
+
+def test_checks():
+    assert fairplay._type_checks(3, ["!int"]) == []
+    assert fairplay._type_checks(True, ["!int"]) == ["!int"]
+    assert fairplay._type_checks(3.0, ["!float"]) == []
+    assert fairplay._type_checks(math.inf, ["!finite"]) == ["!finite"]
+    assert fairplay._type_checks(0, ["!<=0"]) == ["!<=0"]
+    assert fairplay._type_checks(8, ["!<9"]) == ["!<9"]
