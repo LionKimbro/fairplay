@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import random
 import tempfile
 import time
 import uuid
@@ -42,9 +41,6 @@ config = {
     "minimum_reup_seconds": 1,
     "auto_retry_max_attempts": 5,
     "auto_retry_wait_interval_ms": 100,
-    "retry_max_attempts": 5,
-    "retry_wait_interval_ms": 1000,
-    "retry_jitter_ms": 250,
     "block_timeout_seconds": 10,
 }
 
@@ -89,6 +85,7 @@ def new_context():
         "operation_guid": str(uuid.uuid4()),
         "intended_claims": [],
         "published_claims": [],
+        "attempted_claims": [],
         "contention_window_ends_at": None,
         "last_result": None,
         "last_competing_claims": [],
@@ -97,7 +94,6 @@ def new_context():
         "claim_scan_diagnostics": [],
         "result": None,
         "block_started_at": None,
-        "acquisition_retry_count": 0,
     }
 
 
@@ -152,11 +148,13 @@ def cleanup(ctxt):
 
 
 def make_claims(ctxt, lease_seconds, flags=None):
-    """Publish immutable claims, optionally waiting and retrying for authorization."""
+    """Inspect, publish, and optionally wait for claim authorization."""
     _require_context(ctxt)
     _validate_config(ctxt["config"])
     _validate_number(lease_seconds, "lease_seconds")
-    flags = _validate_flags(flags, {"block", "retry", "auto-retry"})
+    flags = _validate_flags(flags, {"block", "auto-retry", "auto-withdraw"})
+    if "auto-withdraw" in flags and "block" not in flags:
+        raise ValueError("auto-withdraw requires block")
     if not ctxt["intended_claims"]:
         _prepare_result(ctxt, "make_claims")
         _set_status(ctxt, NO_LEASE)
@@ -164,43 +162,56 @@ def make_claims(ctxt, lease_seconds, flags=None):
             "lease_seconds": lease_seconds,
             "contention_window_ends_at": None,
             "claims_created": [],
-            "claims_removed_before_retry": [],
             "diagnostics": ["No intended targets were recorded for this operation."],
         })
         return _pop_result(ctxt)
-    ctxt["acquisition_retry_count"] = 0
     ctxt["block_started_at"] = time.monotonic() if "block" in flags else None
-    removed_before_retry = []
-
-    while True:
-        claims_created = _publish_claims(ctxt, lease_seconds)
+    ctxt["attempted_claims"] = []
+    _scan_claims(ctxt)
+    attempts = 0
+    while ctxt["claim_scan_status"] == RETRY and "auto-retry" in flags and attempts < ctxt["config"]["auto_retry_max_attempts"]:
+        attempts += 1
+        _sleep_ms(ctxt["config"]["auto_retry_wait_interval_ms"])
         _scan_claims(ctxt)
+    if ctxt["claim_scan_status"] == RETRY:
         _prepare_result(ctxt, "make_claims")
-        _set_status(ctxt, WAIT)
+        _set_status(ctxt, RETRY)
         _update_result(ctxt, {
             "lease_seconds": lease_seconds,
-            "contention_window_ends_at": ctxt["contention_window_ends_at"],
-            "claims_created": claims_created,
-            "claims_removed_before_retry": removed_before_retry,
-            "retry": _retry_details(ctxt),
+            "retry": _retry_details(ctxt, attempts),
+            "diagnostics": ctxt["claim_scan_diagnostics"],
         })
-        result = _pop_result(ctxt)
-        if "block" not in flags:
-            return result
-
-        checked = _wait_and_check_for_claim_acquisition(ctxt, flags)
-        checked["function"] = "make_claims"
-        checked["lease_seconds"] = lease_seconds
-        checked["claims_created"] = claims_created
-        checked["claims_removed_before_retry"] = removed_before_retry
-        if checked["status"] != COMPETING_CLAIM:
-            return checked
-        if not _may_retry_this_claim_acquisition(ctxt):
-            return checked
-        release = release_claims(ctxt)
-        removed_before_retry.extend(release["claims_released"])
-        ctxt["acquisition_retry_count"] += 1
-        _sleep_for_acquisition_retry(ctxt)
+        return _pop_result(ctxt)
+    competition = _scan_competition(ctxt)
+    if competition["competing_claims"]:
+        ctxt["last_competing_claims"] = competition["competing_claims"]
+        _prepare_result(ctxt, "make_claims")
+        _set_status(ctxt, COMPETING_CLAIM)
+        _update_result(ctxt, {"lease_seconds": lease_seconds, "competing_claims": competition["competing_claims"]})
+        return _pop_result(ctxt)
+    claims_created = _publish_claims(ctxt, lease_seconds)
+    ctxt["attempted_claims"].extend(claims_created)
+    _prepare_result(ctxt, "make_claims")
+    _set_status(ctxt, WAIT)
+    _update_result(ctxt, {
+        "lease_seconds": lease_seconds,
+        "contention_window_ends_at": ctxt["contention_window_ends_at"],
+        "claims_created": claims_created,
+        "retry": _retry_details(ctxt, attempts),
+    })
+    result = _pop_result(ctxt)
+    if "block" not in flags:
+        return result
+    checked = _wait_and_check_for_claim_acquisition(ctxt, flags)
+    checked["function"] = "make_claims"
+    checked["lease_seconds"] = lease_seconds
+    checked["claims_created"] = claims_created
+    if "auto-withdraw" in flags and checked["status"] != OK:
+        withdrawal = _withdraw_current_attempt_claims(ctxt)
+        checked["claims_auto_withdrawn"] = withdrawal["claims_released"]
+        checked["auto_withdraw_missing"] = withdrawal["claim_files_missing"]
+        checked["auto_withdraw_failures"] = withdrawal["release_failures"]
+    return checked
 
 
 def release_claims(ctxt):
@@ -233,39 +244,57 @@ def release_claims(ctxt):
     return _pop_result(ctxt)
 
 
+def _withdraw_current_attempt_claims(ctxt):
+    records = list(ctxt["attempted_claims"])
+    released = []
+    missing = []
+    failures = []
+    retained = []
+    for record in records:
+        claim_path = Path(record["claim_file"])
+        try:
+            claim_path.unlink()
+            released.append(dict(record))
+        except FileNotFoundError:
+            missing.append(dict(record))
+        except OSError as error:
+            retained.append(record)
+            failures.append({"claim": dict(record), "error": str(error)})
+    withdrawn_paths = {record["claim_file"] for record in records if record not in retained}
+    ctxt["published_claims"] = [
+        record for record in ctxt["published_claims"] if record["claim_file"] not in withdrawn_paths
+    ]
+    ctxt["attempted_claims"] = retained
+    return {
+        "claims_released": released,
+        "claim_files_missing": missing,
+        "release_failures": failures,
+    }
+
+
 def check_competitors(ctxt, expected_seconds, flags=None):
     """Return whether this context may begin its next writing batch."""
     _require_context(ctxt)
     _validate_config(ctxt["config"])
     expected_seconds = _normalize_expected_seconds(expected_seconds)
-    flags = _validate_flags(flags, {"block", "re-up", "auto-retry"})
-    ctxt["block_started_at"] = time.monotonic() if "block" in flags else None
-    ctxt["acquisition_retry_count"] = 0
+    flags = _validate_flags(flags, {"re-up", "auto-retry"})
     return _check_competitors(ctxt, expected_seconds, flags)
 
 
 def _check_competitors(ctxt, expected_seconds, flags=None):
     flags = flags or []
-    while True:
-        _scan_claims(ctxt)
-        result = _check_once(ctxt, expected_seconds, flags)
-        result["retry"] = _retry_details(ctxt)
-        if result["status"] == RETRY and "auto-retry" in flags:
-            attempts = 0
-            while result["status"] == RETRY and attempts < ctxt["config"]["auto_retry_max_attempts"]:
-                attempts += 1
-                _sleep_ms(ctxt["config"]["auto_retry_wait_interval_ms"])
-                _scan_claims(ctxt)
-                result = _check_once(ctxt, expected_seconds, flags)
-            result["retry"] = _retry_details(ctxt, attempts)
-        if result["status"] != WAIT or "block" not in flags:
-            return result
-        if _is_block_expired(ctxt):
-            _prepare_result(ctxt, "check_competitors")
-            _set_status(ctxt, TIMEOUT)
-            _update_result(ctxt, {"expected_seconds": expected_seconds})
-            return _pop_result(ctxt)
-        _sleep_until_contention_window_or_timeout(ctxt)
+    _scan_claims(ctxt)
+    result = _check_once(ctxt, expected_seconds, flags)
+    result["retry"] = _retry_details(ctxt)
+    if result["status"] == RETRY and "auto-retry" in flags:
+        attempts = 0
+        while result["status"] == RETRY and attempts < ctxt["config"]["auto_retry_max_attempts"]:
+            attempts += 1
+            _sleep_ms(ctxt["config"]["auto_retry_wait_interval_ms"])
+            _scan_claims(ctxt)
+            result = _check_once(ctxt, expected_seconds, flags)
+        result["retry"] = _retry_details(ctxt, attempts)
+    return result
 
 
 def _check_once(ctxt, expected_seconds, flags=None):
@@ -282,7 +311,7 @@ def _check_once(ctxt, expected_seconds, flags=None):
         _set_status(ctxt, NO_LEASE)
         _update_result(ctxt, {"expected_seconds": expected_seconds})
         return _pop_result(ctxt)
-    scan = _scan_for_competing_claims(ctxt)
+    scan = _scan_competition(ctxt)
     if scan["competing_claims"]:
         ctxt["last_competing_claims"] = scan["competing_claims"]
         _prepare_result(ctxt, "check_competitors")
@@ -406,7 +435,7 @@ def _scan_claims(ctxt):
     ctxt["claim_scan_diagnostics"] = diagnostics
 
 
-def _scan_for_competing_claims(ctxt):
+def _scan_competition(ctxt):
     competitors = []
     if ctxt["claim_scan_status"] == RETRY:
         return {"status": RETRY, "competing_claims": [], "diagnostics": ctxt["claim_scan_diagnostics"]}
@@ -531,20 +560,16 @@ def _registry():
 
 
 def _wait_and_check_for_claim_acquisition(ctxt, flags=None):
-    check_flags = [flag for flag in flags or [] if flag in {"block", "auto-retry"}]
-    return _check_competitors(ctxt, 0, check_flags)
+    _sleep_until_contention_window_or_timeout(ctxt)
+    if _block_has_expired(ctxt):
+        _prepare_result(ctxt, "make_claims")
+        _set_status(ctxt, TIMEOUT)
+        return _pop_result(ctxt)
+    return _check_competitors(ctxt, 0, flags)
 
 
-def _may_retry_this_claim_acquisition(ctxt):
-    limit = ctxt["config"]["retry_max_attempts"]
-    if _is_block_expired(ctxt):
-        return False
-    return limit is None or ctxt["acquisition_retry_count"] < limit
-
-
-def _sleep_for_acquisition_retry(ctxt):
-    delay = ctxt["config"]["retry_wait_interval_ms"] + random.uniform(0, ctxt["config"]["retry_jitter_ms"])
-    _sleep_ms(delay)
+def _sleep_ms(milliseconds):
+    time.sleep(milliseconds / 1000)
 
 
 def _sleep_until_contention_window_or_timeout(ctxt):
@@ -556,9 +581,9 @@ def _sleep_until_contention_window_or_timeout(ctxt):
     time.sleep(seconds)
 
 
-def _is_block_expired(ctxt):
+def _block_has_expired(ctxt):
     timeout = ctxt["config"]["block_timeout_seconds"]
-    return timeout is not None and time.monotonic() - ctxt["block_started_at"] >= timeout
+    return ctxt["block_started_at"] is not None and timeout is not None and time.monotonic() - ctxt["block_started_at"] >= timeout
 
 
 def _lease_time(records):
@@ -627,8 +652,7 @@ def _own_claim_summaries(ctxt):
 def _retry_details(ctxt, auto_retries=0):
     return {
         "auto_retry_attempts": auto_retries,
-        "acquisition_retry_attempts": ctxt["acquisition_retry_count"] if ctxt else 0,
-        "max_attempts": ctxt["config"]["retry_max_attempts"] if ctxt else None,
+        "max_attempts": ctxt["config"]["auto_retry_max_attempts"] if ctxt else None,
         "will_retry": False,
     }
 
@@ -640,7 +664,7 @@ def _require_setup():
 
 def _require_context(ctxt):
     _require_setup()
-    required = {"config", "session_guid", "operation_guid", "intended_claims", "published_claims"}
+    required = {"config", "session_guid", "operation_guid", "intended_claims", "published_claims", "attempted_claims"}
     if not isinstance(ctxt, dict) or not required.issubset(ctxt):
         raise ValueError("ctxt must be a context returned by fairplay.new_context()")
 
@@ -648,19 +672,15 @@ def _require_context(ctxt):
 def _validate_config(values):
     required = {
         "minimum_reup_seconds", "auto_retry_max_attempts", "auto_retry_wait_interval_ms",
-        "retry_max_attempts", "retry_wait_interval_ms", "retry_jitter_ms", "block_timeout_seconds",
+        "block_timeout_seconds",
     }
     if not isinstance(values, dict) or set(values) != required:
         raise FairPlayConfigurationError("config must contain exactly the specified Fair Play keys")
     if _type_checks(values["minimum_reup_seconds"], ["!finite", "!<=0"]):
         raise FairPlayConfigurationError("minimum_reup_seconds must be positive")
-    for name in ("retry_wait_interval_ms", "retry_jitter_ms"):
-        _validate_nonnegative(values[name], name)
     for name in ("auto_retry_max_attempts", "auto_retry_wait_interval_ms"):
         if _type_checks(values[name], ["!int", "!<0"]):
             raise FairPlayConfigurationError(f"{name} must be a non-negative integer")
-    if values["retry_max_attempts"] is not None and _type_checks(values["retry_max_attempts"], ["!int", "!<0"]):
-        raise FairPlayConfigurationError("retry_max_attempts must be a non-negative integer or None")
     timeout = values["block_timeout_seconds"]
     if timeout is not None:
         _validate_number(timeout, "block_timeout_seconds")
@@ -679,7 +699,7 @@ def _validate_number(value, name):
         raise ValueError(f"{name} must be a positive finite number")
 
 
-def _validate_nonnegative(value, name):
+def _validate_is_nonnegative(value, name):
     if _type_checks(value, ["!finite", "!<0"]):
         raise FairPlayConfigurationError(f"{name} must be a non-negative finite number")
 
@@ -705,7 +725,7 @@ def _type_checks(value, flags):
 
 
 def _normalize_expected_seconds(value):
-    _validate_nonnegative(value, "expected_seconds")
+    _validate_is_nonnegative(value, "expected_seconds")
     return math.ceil(value)
 
 

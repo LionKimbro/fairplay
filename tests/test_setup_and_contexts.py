@@ -22,10 +22,10 @@ def test_contexts():
     fairplay.setup()
     first = fairplay.new_context()
     second = fairplay.new_context()
-    fairplay.config["retry_max_attempts"] = 9
+    fairplay.config["auto_retry_max_attempts"] = 9
     assert first["session_guid"] == second["session_guid"]
     assert first["operation_guid"] != second["operation_guid"]
-    assert first["config"]["retry_max_attempts"] == 5
+    assert first["config"]["auto_retry_max_attempts"] == 5
 
 
 def test_registry(monkeypatch, tmp_path):

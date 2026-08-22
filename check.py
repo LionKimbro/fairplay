@@ -125,6 +125,8 @@ def _judge_this_name(definition: dict[str, Any]) -> str | None:
     name = definition["name"]
     calls = definition["calls"]
     words = _count_meaningful_words_in_function_name(name)
+    if name.startswith("pytest_"):
+        return None
     if _is_callback_handler_name(name):
         if words < 3:
             return "callback handlers need at least three words after handle_/on_"
@@ -221,8 +223,8 @@ def _is_public_repeatedly_callable_function(definition: dict[str, Any]) -> bool:
     if definition["name"].startswith("_"):
         return False
     path = definition["path"]
-    return path.name == "__init__.py" or definition["name"] == "main" or (
-        path.parent.name == "tests" and definition["name"].startswith("test_")
+    return path.name in {"__init__.py", "chuck_moore.py"} or definition["name"] == "main" or (
+        path.parent.name == "tests" and definition["name"].startswith(("test_", "pytest_"))
     )
 
 

@@ -108,8 +108,8 @@ Use two separate contexts with distinct session GUIDs to model participants.
   `OK`, a decisive failure, or `TIMEOUT` according to configuration.
 - `"auto-retry"` retries unreadable inspection failures exactly up to its
   configured limit.
-- Acquisition retries remove only the operation's prior attempted claims,
-  use fresh claim GUIDs, and obey retry count, interval, jitter, and timeout.
+- A failed blocked acquisition using `"auto-withdraw"` removes only claims
+  created by that call; previously published claims in the context remain.
 
 ### Re-up tests
 

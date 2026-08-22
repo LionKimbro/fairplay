@@ -62,10 +62,7 @@ The initial keys are:
 | `minimum_reup_seconds` | positive `int` or `float`; `1` | The minimum remaining lease time required to perform a re-up. Below this threshold, re-up is refused and the caller has `NO_LEASE`. |
 | `auto_retry_max_attempts` | non-negative `int`; `5` | Maximum retries for a transient inspection uncertainty when the caller supplies `"auto-retry"`. `0` means no retries after the first failed inspection. |
 | `auto_retry_wait_interval_ms` | non-negative `int`; `100` | Delay, in milliseconds, between automatic retries of an unreadable, incomplete, or temporarily uninterpretable claim file. |
-| `retry_max_attempts` | non-negative `int` or `None`; `5` | Maximum fresh acquisition attempts when the caller supplies `"retry"`. `None` permits unlimited attempts. |
-| `retry_wait_interval_ms` | non-negative `int`; `1000` | Base delay, in milliseconds, before a fresh retry after a competing claim. |
-| `retry_jitter_ms` | non-negative `int`; `250` | Maximum random additional delay, in milliseconds, added to each competing-claim retry. It prevents repeated synchronized collisions. |
-| `block_timeout_seconds` | positive `int` or `float`, or `None`; `10` | Total time a `"block"` call may wait and retry before returning `OK`, another decisive status, or `TIMEOUT`. `None` means no timeout. |
+| `block_timeout_seconds` | positive `int` or `float`, or `None`; `10` | Total time a `"block"` call may wait before returning `OK`, another decisive status, or `TIMEOUT`. `None` means no timeout. |
 
 An invalid configuration value is a caller error and must be rejected before an operation begins. Durations are numeric seconds except for keys explicitly ending in `_ms`.
 
@@ -133,7 +130,11 @@ Cleanup skips a claim file it cannot read. It does not retry unreadable files an
 result = fairplay.make_claims(ctxt, lease_seconds, flags=None)
 ```
 
-Publishes immutable JSON claim files for the context's intended targets. `lease_seconds` is the requested lease duration. The normal non-blocking result after successful publication is `WAIT`, because the five-second contention window has not finished.
+First scans for competing claims, then publishes immutable JSON claim files for
+the context's intended targets when clear. `lease_seconds` is the requested
+lease duration. A live competitor produces `COMPETING_CLAIM` without publishing
+anything. The normal non-blocking result after successful publication is
+`WAIT`, because the five-second contention window has not finished.
 
 The caller must not write after `WAIT`. It must call `check_competitors()` after the required observation period and receive `OK` for the intended writing batch.
 
@@ -143,7 +144,7 @@ The caller must not write after `WAIT`. It must call `check_competitors()` after
 result = fairplay.release_claims(ctxt)
 ```
 
-Deletes only the claim files recorded in this context's `published_claims` list. It is the normal final action after a writing operation, and it is also used before a failed acquisition attempt is retried. It never deletes claims merely because they share the same session GUID.
+Deletes only the claim files recorded in this context's `published_claims` list. It is the normal final action after a writing operation. It never deletes claims merely because they share the same session GUID.
 
 The result reports `claims_considered`, `claims_released`, `claim_files_missing`, and `release_failures`. A missing claim file is reported rather than treated as an error: it may already have been removed by cleanup after expiry.
 
@@ -157,7 +158,7 @@ Checks the context's live claims against the registry. `expected_seconds` is a c
 
 Callers perform a fresh check immediately before a substantial writing batch. A prior `OK` is not authority for later work.
 
-Before the contention window ends, `check_competitors()` returns `WAIT` unless another condition already produces a different status, such as `RETRY`, `COMPETING_CLAIM`, or `NO_LEASE`. With `"block"`, it waits instead of returning `WAIT`, then returns a non-`WAIT` result.
+Before the contention window ends, `check_competitors()` returns `WAIT` unless another condition already produces a different status, such as `RETRY`, `COMPETING_CLAIM`, or `NO_LEASE`.
 
 ## Result dictionaries
 
@@ -173,7 +174,7 @@ Action functions return complex dictionaries. `new_context()` is the one intenti
 | `own_claims` | `list` | Summaries of the context's relevant published claims, including claim GUID, claim-file path, and expiry, when applicable. |
 | `remaining_seconds` | non-negative `int` or `None` | Conservatively rounded-up remaining seconds on the relevant own lease. `None` when no own lease is relevant. |
 | `competing_claims` | `list` | Details of live competing claims found by the scan. Each entry contains `claim_file`, `claim` (the entire parsed JSON object), and `remaining_seconds` (conservatively rounded up). The structure of `claim` is defined in the JSON claim-file-format specification. |
-| `retry` | `dict` | Retry diagnostics: `auto_retry_attempts`, `acquisition_retry_attempts`, `max_attempts`, and `will_retry`. |
+| `retry` | `dict` | Inspection-retry diagnostics: `auto_retry_attempts`, `max_attempts`, and `will_retry`. |
 | `diagnostics` | `list` | Human-readable diagnostic strings, warnings, or implementation-specific structured diagnostic records. |
 
 Function-specific result keys are:
@@ -192,7 +193,9 @@ Function-specific result keys are:
 | `make_claims()` | `lease_seconds` | positive `int` or `float` | Lease duration requested for the newly published claims. |
 | `make_claims()` | `contention_window_ends_at` | comparable timestamp or `None` | Earliest time at which this published claim set can receive `OK`. |
 | `make_claims()` | `claims_created` | `list` | Summaries of claim files successfully published by this call. |
-| `make_claims()` | `claims_removed_before_retry` | `list` | Summaries of this operation's prior attempted claims removed before a fresh retry. |
+| `make_claims()` | `claims_auto_withdrawn` | `list` | Summaries of claims created by this call and withdrawn after a failed blocked acquisition. |
+| `make_claims()` | `auto_withdraw_missing` | `list` | Attempted claim files already absent while auto-withdrawing. |
+| `make_claims()` | `auto_withdraw_failures` | `list` | Claim-file removal failures encountered while auto-withdrawing. |
 | `check_competitors()` | `expected_seconds` | non-negative `int` | Conservative, rounded-up writing duration supplied by the caller for this authorization check. |
 | `check_competitors()` | `contention_window_ends_at` | comparable timestamp or `None` | The relevant claim set's current observation-window end time. |
 | `check_competitors()` | `reup_performed` | `bool` | Whether this call successfully published replacement claims and removed its prior claims. |
@@ -223,12 +226,12 @@ Exact machine-clock comparisons remain authoritative; the remaining-seconds valu
 
 Flags are supplied as `None` or a list of strings. The currently defined flags are:
 
-- `"block"`, accepted by `make_claims()` and `check_competitors()`: the call never returns `WAIT`. It waits through the remaining contention window and applies configured block behavior before returning a resolved status.
-- `"retry"`, accepted by `make_claims()`: after `COMPETING_CLAIM`, removes this operation's attempted claims and performs a fresh acquisition attempt, governed by `retry_max_attempts`, `retry_wait_interval_ms`, and `retry_jitter_ms`.
+- `"block"`, accepted by `make_claims()`: the call never returns `WAIT`. It waits through the remaining contention window before returning a resolved status.
+- `"auto-withdraw"`, accepted by `make_claims()` only with `"block"`: if blocked acquisition ends without `OK`, removes only claims created by that `make_claims()` call. Claims that predated the call remain published.
 - `"re-up"`, accepted by `check_competitors()`: when the only problem is insufficient runway and at least one second remains, it creates replacement immutable claims and removes the prior claims after successful replacement publication.
 - `"auto-retry"`, accepted by inspection/check operations: it retries transient unreadable or incomplete claim files using the configured retry policy.
 
-For `make_claims()`, `"block"` includes fresh competing-claim retries until it acquires authorization or reaches `block_timeout_seconds`. For `check_competitors()`, it waits through the remaining contention window rather than returning `WAIT`; a competitor or other non-`WAIT` condition is still reported as soon as it is determined. A caller that wants blocking indefinitely sets `block_timeout_seconds` to `None`. If a blocked acquisition retries, it first removes the context's own attempted claims and uses fresh claim GUIDs; randomized backoff prevents repeated synchronized collisions.
+For `make_claims()`, the initial scan reports a live competitor before publishing a claim. With `"block"`, a successful publication waits through the contention window rather than returning `WAIT`; a competitor or other non-`WAIT` condition is reported as soon as it is determined. A caller that wants blocking indefinitely sets `block_timeout_seconds` to `None`.
 
 ## Typical non-blocking use
 

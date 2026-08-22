@@ -8,6 +8,15 @@ import pytest
 import fairplay
 
 
+def pytest_addoption(parser):
+    parser.addoption("--fairplay-implementation", choices=("full", "chuck"), default="full")
+
+
+def pytest_runtest_setup(item):
+    if item.config.getoption("--fairplay-implementation") == "chuck" and item.path.name != "test_protocol.py":
+        pytest.skip("This test covers full-version validation or result machinery.")
+
+
 class TestClock:
     def __init__(self) -> None:
         self.current = datetime(2026, 8, 22, tzinfo=timezone.utc)
@@ -40,9 +49,6 @@ def _reset_fairplay_for_every_test(monkeypatch: pytest.MonkeyPatch, tmp_path):
         "minimum_reup_seconds": 1,
         "auto_retry_max_attempts": 5,
         "auto_retry_wait_interval_ms": 100,
-        "retry_max_attempts": 5,
-        "retry_wait_interval_ms": 1000,
-        "retry_jitter_ms": 250,
         "block_timeout_seconds": 10,
     })
 
@@ -53,3 +59,20 @@ def test_clock(monkeypatch: pytest.MonkeyPatch) -> TestClock:
     monkeypatch.setattr(fairplay, "_now", clock.now)
     monkeypatch.setattr(fairplay, "time", SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
     return clock
+
+
+@pytest.fixture
+def test_implementation(request, monkeypatch):
+    if request.config.getoption("--fairplay-implementation") == "full":
+        return fairplay
+    from fairplay import chuck_moore
+
+    tmp_path = request.getfixturevalue("tmp_path")
+    monkeypatch.setattr(chuck_moore.machineroot, "get", lambda key: str(tmp_path))
+    chuck_moore.process.clear()
+    chuck_moore.process.update({
+        "session_guid": None,
+        "registry_path": tmp_path / "claims",
+        "contention_window_seconds": 0,
+    })
+    return chuck_moore
