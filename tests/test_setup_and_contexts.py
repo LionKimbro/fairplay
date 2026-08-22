@@ -28,6 +28,18 @@ def test_contexts():
     assert first["config"]["retry_max_attempts"] == 5
 
 
+def test_registry(monkeypatch, tmp_path):
+    calls = []
+    fairplay.process["registry_path"] = None
+    monkeypatch.setattr(fairplay.machineroot, "get", lambda key: calls.append(key) or str(tmp_path))
+    fairplay.setup()
+    first = fairplay.process["registry_path"]
+    fairplay.setup()
+    assert calls == ["fair-play"]
+    assert first == fairplay.process["registry_path"]
+    assert first == tmp_path / "claims"
+
+
 def test_checks():
     assert fairplay._type_checks(3, ["!int"]) == []
     assert fairplay._type_checks(True, ["!int"]) == ["!int"]

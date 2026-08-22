@@ -7,8 +7,7 @@ import fairplay
 
 def test_cleanup(test_clock):
     fairplay.setup()
-    registry = fairplay.g["registry_path"]
-    registry.mkdir()
+    registry = fairplay.process["registry_path"]
     claim_guid = "00000000-0000-4000-8000-000000000010"
     (registry / f"{claim_guid}.json").write_text(json.dumps({
         "claim_guid": claim_guid,

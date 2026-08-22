@@ -35,6 +35,7 @@ TIMEOUT = "TIMEOUT"
 process = {
     "session_guid": None,
     "contention_window_seconds": 5,
+    "registry_path": None,
 }
 
 config = {
@@ -46,11 +47,6 @@ config = {
     "retry_jitter_ms": 250,
     "block_timeout_seconds": 10,
 }
-
-g = {
-    "registry_path": None,
-}
-
 
 class FairPlaySetupRequiredError(RuntimeError):
     """Raised when a Fair Play operation is used before setup()."""
@@ -64,6 +60,10 @@ def setup():
     """Initialize the stable process session identity."""
     if process["session_guid"] is None:
         process["session_guid"] = str(uuid.uuid4())
+    if process["registry_path"] is None:
+        process["registry_path"] = Path(machineroot.get("fair-play")) / "claims"
+    process["registry_path"] = Path(process["registry_path"])
+    process["registry_path"].mkdir(parents=True, exist_ok=True)
     return {
         "status": OK,
         "function": "setup",
@@ -92,6 +92,9 @@ def new_context():
         "contention_window_ends_at": None,
         "last_result": None,
         "last_competing_claims": [],
+        "claim_scan": [],
+        "claim_scan_status": None,
+        "claim_scan_diagnostics": [],
         "result": None,
         "block_started_at": None,
         "acquisition_retry_count": 0,
@@ -121,7 +124,7 @@ def cleanup(ctxt):
         "invalid_claim_files": 0,
         "remove_failures": [],
     }
-    registry = _get_registry()
+    registry = _registry()
     for claim_path in registry.glob("*.json"):
         counts["files_seen"] += 1
         try:
@@ -171,6 +174,7 @@ def make_claims(ctxt, lease_seconds, flags=None):
 
     while True:
         claims_created = _publish_claims(ctxt, lease_seconds)
+        _scan_claims(ctxt)
         _prepare_result(ctxt, "make_claims")
         _set_status(ctxt, WAIT)
         _update_result(ctxt, {
@@ -243,6 +247,7 @@ def check_competitors(ctxt, expected_seconds, flags=None):
 def _check_competitors(ctxt, expected_seconds, flags=None):
     flags = flags or []
     while True:
+        _scan_claims(ctxt)
         result = _check_once(ctxt, expected_seconds, flags)
         result["retry"] = _retry_details(ctxt)
         if result["status"] == RETRY and "auto-retry" in flags:
@@ -250,6 +255,7 @@ def _check_competitors(ctxt, expected_seconds, flags=None):
             while result["status"] == RETRY and attempts < ctxt["config"]["auto_retry_max_attempts"]:
                 attempts += 1
                 _sleep_ms(ctxt["config"]["auto_retry_wait_interval_ms"])
+                _scan_claims(ctxt)
                 result = _check_once(ctxt, expected_seconds, flags)
             result["retry"] = _retry_details(ctxt, attempts)
         if result["status"] != WAIT or "block" not in flags:
@@ -264,6 +270,11 @@ def _check_competitors(ctxt, expected_seconds, flags=None):
 
 def _check_once(ctxt, expected_seconds, flags=None):
     flags = flags or []
+    if ctxt["claim_scan_status"] == RETRY:
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, RETRY)
+        _update_result(ctxt, {"expected_seconds": expected_seconds, "diagnostics": ctxt["claim_scan_diagnostics"]})
+        return _pop_result(ctxt)
     own_claims = _read_claims(ctxt)
     remaining = _lease_time(own_claims)
     if not own_claims or remaining is None or remaining < ctxt["config"]["minimum_reup_seconds"]:
@@ -272,11 +283,6 @@ def _check_once(ctxt, expected_seconds, flags=None):
         _update_result(ctxt, {"expected_seconds": expected_seconds})
         return _pop_result(ctxt)
     scan = _scan_for_competing_claims(ctxt)
-    if scan["status"] == RETRY:
-        _prepare_result(ctxt, "check_competitors")
-        _set_status(ctxt, RETRY)
-        _update_result(ctxt, {"expected_seconds": expected_seconds, "diagnostics": scan["diagnostics"]})
-        return _pop_result(ctxt)
     if scan["competing_claims"]:
         ctxt["last_competing_claims"] = scan["competing_claims"]
         _prepare_result(ctxt, "check_competitors")
@@ -293,6 +299,7 @@ def _check_once(ctxt, expected_seconds, flags=None):
         if "re-up" in flags:
             reup = _publish_replacement_claims_now(ctxt)
             if reup is not None:
+                _scan_claims(ctxt)
                 replacement_remaining = _lease_time(_read_claims(ctxt))
                 if replacement_remaining is not None and replacement_remaining >= expected_seconds:
                     _prepare_result(ctxt, "check_competitors")
@@ -325,7 +332,7 @@ def _publish_claims(ctxt, lease_seconds):
         "expires_at": _format_time(datetime.fromtimestamp(expires_at, timezone.utc)),
         "targets": [{"scope": scope, "path": path} for scope, path in ctxt["intended_claims"]],
     }
-    claim_path = _get_registry() / f"{claim_guid}.json"
+    claim_path = _registry() / f"{claim_guid}.json"
     _write_immutable_claim(claim_path, claim)
     record = {
         "claim_guid": claim_guid,
@@ -371,40 +378,61 @@ def _publish_replacement_claims_now(ctxt):
     }
 
 
-def _scan_for_competing_claims(ctxt):
-    competitors = []
+def _scan_claims(ctxt):
+    claims = []
     diagnostics = []
-    for claim_path in _get_registry().glob("*.json"):
+    for claim_path in _registry().glob("*.json"):
         try:
             claim = _read_claim(claim_path)
             expiry = _claim_expiry(claim)
-            targets = _claim_targets(claim)
+            targets = _extract_claim_targets(claim)
             session_guid = claim.get("session_guid")
             if expiry is None or targets is None or not isinstance(session_guid, str) or not session_guid:
                 raise ValueError("claim lacks required comparison information")
         except (OSError, ValueError, json.JSONDecodeError) as error:
             diagnostics.append(f"Could not reliably inspect {claim_path.name}: {error}")
-            return {"status": RETRY, "competing_claims": [], "diagnostics": diagnostics}
-        if expiry <= _now() or session_guid == ctxt["session_guid"]:
+            ctxt["claim_scan"] = []
+            ctxt["claim_scan_status"] = RETRY
+            ctxt["claim_scan_diagnostics"] = diagnostics
+            return
+        claims.append({
+            "claim_file": str(claim_path),
+            "claim": claim,
+            "expiry": expiry,
+            "targets": targets,
+        })
+    ctxt["claim_scan"] = claims
+    ctxt["claim_scan_status"] = OK
+    ctxt["claim_scan_diagnostics"] = diagnostics
+
+
+def _scan_for_competing_claims(ctxt):
+    competitors = []
+    if ctxt["claim_scan_status"] == RETRY:
+        return {"status": RETRY, "competing_claims": [], "diagnostics": ctxt["claim_scan_diagnostics"]}
+    for scanned in ctxt["claim_scan"]:
+        claim = scanned["claim"]
+        expiry = scanned["expiry"]
+        if expiry <= _now() or claim["session_guid"] == ctxt["session_guid"]:
             continue
-        if _has_overlap(ctxt["intended_claims"], targets):
+        if _has_overlap(ctxt["intended_claims"], scanned["targets"]):
             competitors.append({
-                "claim_file": str(claim_path),
+                "claim_file": scanned["claim_file"],
                 "claim": claim,
                 "remaining_seconds": _remaining_lease(expiry),
             })
-    return {"status": OK, "competing_claims": competitors, "diagnostics": diagnostics}
+    return {"status": OK, "competing_claims": competitors, "diagnostics": []}
 
 
 def _read_claims(ctxt):
     records = []
     for record in ctxt["published_claims"]:
-        try:
-            claim = _read_claim(Path(record["claim_file"]))
-            expiry = _claim_expiry(claim)
-            targets = _claim_targets(claim)
-        except (OSError, ValueError, json.JSONDecodeError):
+        scanned = next((entry for entry in ctxt["claim_scan"] if entry["claim_file"] == record["claim_file"]), None)
+        if scanned is None:
             continue
+        claim = scanned["claim"]
+        expiry = scanned["expiry"]
+        targets = scanned["targets"]
         if claim.get("session_guid") != ctxt["session_guid"] or expiry is None or targets is None:
             continue
         if expiry > _now() and _has_overlap(ctxt["intended_claims"], targets):
@@ -434,7 +462,7 @@ def _claim_expiry(claim):
         return None
 
 
-def _claim_targets(claim):
+def _extract_claim_targets(claim):
     raw_targets = claim.get("targets")
     if not isinstance(raw_targets, list) or not raw_targets:
         return None
@@ -498,12 +526,8 @@ def _write_immutable_claim(claim_path, claim):
         raise
 
 
-def _get_registry():
-    if g["registry_path"] is None:
-        g["registry_path"] = Path(machineroot.get("fair-play")) / "claims"
-    registry = Path(g["registry_path"])
-    registry.mkdir(parents=True, exist_ok=True)
-    return registry
+def _registry():
+    return process["registry_path"]
 
 
 def _wait_and_check_for_claim_acquisition(ctxt, flags=None):

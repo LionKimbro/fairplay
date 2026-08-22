@@ -30,7 +30,11 @@ class TestClock:
 @pytest.fixture(autouse=True)
 def _reset_fairplay_for_every_test(monkeypatch: pytest.MonkeyPatch, tmp_path):
     fairplay.process.clear()
-    fairplay.process.update({"session_guid": None, "contention_window_seconds": 5})
+    fairplay.process.update({
+        "session_guid": None,
+        "contention_window_seconds": 5,
+        "registry_path": tmp_path / "claims",
+    })
     fairplay.config.clear()
     fairplay.config.update({
         "minimum_reup_seconds": 1,
@@ -41,7 +45,6 @@ def _reset_fairplay_for_every_test(monkeypatch: pytest.MonkeyPatch, tmp_path):
         "retry_jitter_ms": 250,
         "block_timeout_seconds": 10,
     })
-    fairplay.g["registry_path"] = tmp_path / "claims"
 
 
 @pytest.fixture

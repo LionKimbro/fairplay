@@ -11,7 +11,7 @@ def test_claims(test_clock):
     ctxt = fairplay.new_context()
     fairplay.intend_claims(ctxt, [(fairplay.FILE, "example.txt")])
     result = fairplay.make_claims(ctxt, 30)
-    claim_path = next(fairplay.g["registry_path"].glob("*.json"))
+    claim_path = next(fairplay.process["registry_path"].glob("*.json"))
     claim = json.loads(claim_path.read_text(encoding="utf-8"))
     assert result["status"] == fairplay.WAIT
     assert claim_path.stem == claim["claim_guid"]
