@@ -65,7 +65,19 @@ def setup() -> dict[str, Any]:
     """Initialize the stable process session identity."""
     if process["session_guid"] is None:
         process["session_guid"] = str(uuid.uuid4())
-    return _result("setup", OK, None, process=dict(process))
+    return {
+        "status": OK,
+        "function": "setup",
+        "timestamp": _format_time(_now()),
+        "session_guid": process["session_guid"],
+        "operation_guid": None,
+        "own_claims": [],
+        "remaining_seconds": None,
+        "competing_claims": [],
+        "retry": _retry_details(None),
+        "diagnostics": [],
+        "process": dict(process),
+    }
 
 
 def new_context() -> dict[str, Any]:
@@ -81,6 +93,9 @@ def new_context() -> dict[str, Any]:
         "contention_window_ends_at": None,
         "last_result": None,
         "last_competing_claims": [],
+        "result": None,
+        "block_started_at": None,
+        "acquisition_retry_count": 0,
     }
 
 
@@ -89,7 +104,10 @@ def intend_claims(ctxt: dict[str, Any], list_of_claims: list[tuple[str, str]]) -
     _require_context(ctxt)
     targets = [_normalize_target(claim) for claim in list_of_claims]
     ctxt["intended_claims"] = targets
-    return _result("intend_claims", OK, ctxt, intended_claims=list(targets))
+    _prepare_result(ctxt, "intend_claims")
+    _set_status(ctxt, OK)
+    _update_result(ctxt, {"intended_claims": list(targets)})
+    return _return_result(ctxt)
 
 
 def cleanup(ctxt: dict[str, Any]) -> dict[str, Any]:
@@ -104,11 +122,11 @@ def cleanup(ctxt: dict[str, Any]) -> dict[str, Any]:
         "invalid_claim_files": 0,
         "remove_failures": [],
     }
-    registry = _get_claim_registry()
+    registry = _get_registry()
     for claim_path in registry.glob("*.json"):
         counts["files_seen"] += 1
         try:
-            claim = _read_claim_file(claim_path)
+            claim = _read_claim(claim_path)
         except (OSError, ValueError, json.JSONDecodeError):
             counts["unreadable_files"] += 1
             continue
@@ -125,53 +143,60 @@ def cleanup(ctxt: dict[str, Any]) -> dict[str, Any]:
             counts["files_removed"] += 1
         except OSError as error:
             counts["remove_failures"].append({"claim_file": str(claim_path), "error": str(error)})
-    return _result("cleanup", OK, ctxt, **counts)
+    _prepare_result(ctxt, "cleanup")
+    _set_status(ctxt, OK)
+    _update_result(ctxt, counts)
+    return _return_result(ctxt)
 
 
 def make_claims(ctxt: dict[str, Any], lease_seconds: float, flags: list[str] | None = None) -> dict[str, Any]:
     """Publish immutable claims, optionally waiting and retrying for authorization."""
     _require_context(ctxt)
     _validate_config(ctxt["config"])
-    _validate_positive_number(lease_seconds, "lease_seconds")
+    _validate_number(lease_seconds, "lease_seconds")
     flags = _validate_flags(flags, {"block", "retry", "auto-retry"})
     if not ctxt["intended_claims"]:
-        return _result(
-            "make_claims", NO_LEASE, ctxt,
-            lease_seconds=lease_seconds,
-            contention_window_ends_at=None,
-            claims_created=[],
-            claims_removed_before_retry=[],
-            diagnostics=["No intended targets were recorded for this operation."],
-        )
-    retry_count = 0
-    started_at = time.monotonic()
+        _prepare_result(ctxt, "make_claims")
+        _set_status(ctxt, NO_LEASE)
+        _update_result(ctxt, {
+            "lease_seconds": lease_seconds,
+            "contention_window_ends_at": None,
+            "claims_created": [],
+            "claims_removed_before_retry": [],
+            "diagnostics": ["No intended targets were recorded for this operation."],
+        })
+        return _return_result(ctxt)
+    ctxt["acquisition_retry_count"] = 0
+    ctxt["block_started_at"] = time.monotonic() if "block" in flags else None
     removed_before_retry: list[dict[str, Any]] = []
 
     while True:
-        claims_created = _publish_claim_set(ctxt, lease_seconds)
-        result = _result(
-            "make_claims", WAIT, ctxt,
-            lease_seconds=lease_seconds,
-            contention_window_ends_at=ctxt["contention_window_ends_at"],
-            claims_created=claims_created,
-            claims_removed_before_retry=removed_before_retry,
-            retry=_retry_details(retry_count, ctxt, False),
-        )
+        claims_created = _publish_claims(ctxt, lease_seconds)
+        _prepare_result(ctxt, "make_claims")
+        _set_status(ctxt, WAIT)
+        _update_result(ctxt, {
+            "lease_seconds": lease_seconds,
+            "contention_window_ends_at": ctxt["contention_window_ends_at"],
+            "claims_created": claims_created,
+            "claims_removed_before_retry": removed_before_retry,
+            "retry": _retry_details(ctxt),
+        })
+        result = _return_result(ctxt)
         if "block" not in flags:
             return result
 
-        checked = _wait_and_check_for_claim_acquisition(ctxt, lease_seconds, flags, started_at, retry_count)
+        checked = _wait_and_check_for_claim_acquisition(ctxt, flags)
         checked["function"] = "make_claims"
         checked["lease_seconds"] = lease_seconds
         checked["claims_created"] = claims_created
         checked["claims_removed_before_retry"] = removed_before_retry
         if checked["status"] != COMPETING_CLAIM:
             return checked
-        if not _may_retry_acquisition(retry_count, ctxt, started_at):
+        if not _may_retry_this_claim_acquisition(ctxt):
             return checked
         release = release_claims(ctxt)
         removed_before_retry.extend(release["claims_released"])
-        retry_count += 1
+        ctxt["acquisition_retry_count"] += 1
         _sleep_for_acquisition_retry(ctxt)
 
 
@@ -194,13 +219,15 @@ def release_claims(ctxt: dict[str, Any]) -> dict[str, Any]:
             retained.append(record)
             failures.append({"claim": dict(record), "error": str(error)})
     ctxt["published_claims"] = retained
-    return _result(
-        "release_claims", OK, ctxt,
-        claims_considered=len(records),
-        claims_released=released,
-        claim_files_missing=missing,
-        release_failures=failures,
-    )
+    _prepare_result(ctxt, "release_claims")
+    _set_status(ctxt, OK)
+    _update_result(ctxt, {
+        "claims_considered": len(records),
+        "claims_released": released,
+        "claim_files_missing": missing,
+        "release_failures": failures,
+    })
+    return _return_result(ctxt)
 
 
 def check_competitors(ctxt: dict[str, Any], expected_seconds: float, flags: list[str] | None = None) -> dict[str, Any]:
@@ -209,57 +236,89 @@ def check_competitors(ctxt: dict[str, Any], expected_seconds: float, flags: list
     _validate_config(ctxt["config"])
     expected_seconds = _normalize_expected_seconds(expected_seconds)
     flags = _validate_flags(flags, {"block", "re-up", "auto-retry"})
-    started_at = time.monotonic()
-    return _check_competitors_until_decisive(ctxt, expected_seconds, flags, started_at, 0)
+    ctxt["block_started_at"] = time.monotonic() if "block" in flags else None
+    ctxt["acquisition_retry_count"] = 0
+    return _check_competitors(ctxt, expected_seconds, flags)
 
 
-def _check_competitors_until_decisive(
-    ctxt: dict[str, Any], expected_seconds: int, flags: list[str], started_at: float, acquisition_retries: int,
+def _check_competitors(
+    ctxt: dict[str, Any], expected_seconds: int, flags: list[str] | None = None,
 ) -> dict[str, Any]:
+    flags = flags or []
     while True:
-        result = _check_competitors_once(ctxt, expected_seconds, flags)
-        result["retry"] = _retry_details(acquisition_retries, ctxt, False)
+        result = _check_once(ctxt, expected_seconds, flags)
+        result["retry"] = _retry_details(ctxt)
         if result["status"] == RETRY and "auto-retry" in flags:
             attempts = 0
             while result["status"] == RETRY and attempts < ctxt["config"]["auto_retry_max_attempts"]:
                 attempts += 1
                 _sleep_ms(ctxt["config"]["auto_retry_wait_interval_ms"])
-                result = _check_competitors_once(ctxt, expected_seconds, flags)
-            result["retry"] = _retry_details(acquisition_retries, ctxt, False, attempts)
+                result = _check_once(ctxt, expected_seconds, flags)
+            result["retry"] = _retry_details(ctxt, attempts)
         if result["status"] != WAIT or "block" not in flags:
             return result
-        if _block_has_timed_out(ctxt, started_at):
-            return _result("check_competitors", TIMEOUT, ctxt, expected_seconds=expected_seconds)
-        _sleep_until_contention_window_or_timeout(ctxt, started_at)
+        if _is_block_expired(ctxt):
+            _prepare_result(ctxt, "check_competitors")
+            _set_status(ctxt, TIMEOUT)
+            _update_result(ctxt, {"expected_seconds": expected_seconds})
+            return _return_result(ctxt)
+        _sleep_until_contention_window_or_timeout(ctxt)
 
 
-def _check_competitors_once(ctxt: dict[str, Any], expected_seconds: int, flags: list[str]) -> dict[str, Any]:
-    own_claims = _read_own_relevant_claims(ctxt)
-    remaining = _minimum_remaining_seconds(own_claims)
+def _check_once(
+    ctxt: dict[str, Any], expected_seconds: int, flags: list[str] | None = None,
+) -> dict[str, Any]:
+    flags = flags or []
+    own_claims = _read_claims(ctxt)
+    remaining = _lease_time(own_claims)
     if not own_claims or remaining is None or remaining < ctxt["config"]["minimum_reup_seconds"]:
-        return _result("check_competitors", NO_LEASE, ctxt, expected_seconds=expected_seconds)
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, NO_LEASE)
+        _update_result(ctxt, {"expected_seconds": expected_seconds})
+        return _return_result(ctxt)
     scan = _scan_for_competing_claims(ctxt)
     if scan["status"] == RETRY:
-        return _result("check_competitors", RETRY, ctxt, expected_seconds=expected_seconds, diagnostics=scan["diagnostics"])
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, RETRY)
+        _update_result(ctxt, {"expected_seconds": expected_seconds, "diagnostics": scan["diagnostics"]})
+        return _return_result(ctxt)
     if scan["competing_claims"]:
         ctxt["last_competing_claims"] = scan["competing_claims"]
-        return _result("check_competitors", COMPETING_CLAIM, ctxt, expected_seconds=expected_seconds, competing_claims=scan["competing_claims"])
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, COMPETING_CLAIM)
+        _update_result(ctxt, {"expected_seconds": expected_seconds, "competing_claims": scan["competing_claims"]})
+        return _return_result(ctxt)
     ends_at = _parse_time(ctxt["contention_window_ends_at"]) if ctxt["contention_window_ends_at"] else None
     if ends_at is not None and _now() < ends_at:
-        return _result("check_competitors", WAIT, ctxt, expected_seconds=expected_seconds)
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, WAIT)
+        _update_result(ctxt, {"expected_seconds": expected_seconds})
+        return _return_result(ctxt)
     if remaining < expected_seconds:
         if "re-up" in flags:
-            reup = _reup_claims(ctxt)
+            reup = _publish_replacement_claims_now(ctxt)
             if reup is not None:
-                replacement_remaining = _minimum_remaining_seconds(_read_own_relevant_claims(ctxt))
+                replacement_remaining = _lease_time(_read_claims(ctxt))
                 if replacement_remaining is not None and replacement_remaining >= expected_seconds:
-                    return _result("check_competitors", OK, ctxt, expected_seconds=expected_seconds, **reup)
-                return _result("check_competitors", NOT_ENOUGH_TIME, ctxt, expected_seconds=expected_seconds, **reup)
-        return _result("check_competitors", NOT_ENOUGH_TIME, ctxt, expected_seconds=expected_seconds)
-    return _result("check_competitors", OK, ctxt, expected_seconds=expected_seconds)
+                    _prepare_result(ctxt, "check_competitors")
+                    _set_status(ctxt, OK)
+                    _update_result(ctxt, {"expected_seconds": expected_seconds, **reup})
+                    return _return_result(ctxt)
+                _prepare_result(ctxt, "check_competitors")
+                _set_status(ctxt, NOT_ENOUGH_TIME)
+                _update_result(ctxt, {"expected_seconds": expected_seconds, **reup})
+                return _return_result(ctxt)
+        _prepare_result(ctxt, "check_competitors")
+        _set_status(ctxt, NOT_ENOUGH_TIME)
+        _update_result(ctxt, {"expected_seconds": expected_seconds})
+        return _return_result(ctxt)
+    _prepare_result(ctxt, "check_competitors")
+    _set_status(ctxt, OK)
+    _update_result(ctxt, {"expected_seconds": expected_seconds})
+    return _return_result(ctxt)
 
 
-def _publish_claim_set(ctxt: dict[str, Any], lease_seconds: float) -> list[dict[str, Any]]:
+def _publish_claims(ctxt: dict[str, Any], lease_seconds: float) -> list[dict[str, Any]]:
     now = _now()
     expires_at = now.timestamp() + lease_seconds
     claim_guid = str(uuid.uuid4())
@@ -271,7 +330,7 @@ def _publish_claim_set(ctxt: dict[str, Any], lease_seconds: float) -> list[dict[
         "expires_at": _format_time(datetime.fromtimestamp(expires_at, timezone.utc)),
         "targets": [{"scope": scope, "path": path} for scope, path in ctxt["intended_claims"]],
     }
-    claim_path = _get_claim_registry() / f"{claim_guid}.json"
+    claim_path = _get_registry() / f"{claim_guid}.json"
     _write_immutable_claim(claim_path, claim)
     record = {
         "claim_guid": claim_guid,
@@ -287,15 +346,15 @@ def _publish_claim_set(ctxt: dict[str, Any], lease_seconds: float) -> list[dict[
     return [dict(record)]
 
 
-def _reup_claims(ctxt: dict[str, Any]) -> dict[str, Any] | None:
-    records = _read_own_relevant_claims(ctxt)
+def _publish_replacement_claims_now(ctxt: dict[str, Any]) -> dict[str, Any] | None:
+    records = _read_claims(ctxt)
     if not records:
         return None
     lease_seconds = max(record.get("lease_seconds", 0) for record in records)
     if lease_seconds <= 0:
         return None
     prior_records = list(ctxt["published_claims"])
-    replacements = _publish_claim_set(ctxt, lease_seconds)
+    replacements = _publish_claims(ctxt, lease_seconds)
     ctxt["contention_window_ends_at"] = None
     prior_paths = {record["claim_file"] for record in prior_records}
     prior_removed: list[dict[str, Any]] = []
@@ -320,9 +379,9 @@ def _reup_claims(ctxt: dict[str, Any]) -> dict[str, Any] | None:
 def _scan_for_competing_claims(ctxt: dict[str, Any]) -> dict[str, Any]:
     competitors: list[dict[str, Any]] = []
     diagnostics: list[str] = []
-    for claim_path in _get_claim_registry().glob("*.json"):
+    for claim_path in _get_registry().glob("*.json"):
         try:
-            claim = _read_claim_file(claim_path)
+            claim = _read_claim(claim_path)
             expiry = _claim_expiry(claim)
             targets = _claim_targets(claim)
             session_guid = claim.get("session_guid")
@@ -333,34 +392,34 @@ def _scan_for_competing_claims(ctxt: dict[str, Any]) -> dict[str, Any]:
             return {"status": RETRY, "competing_claims": [], "diagnostics": diagnostics}
         if expiry <= _now() or session_guid == ctxt["session_guid"]:
             continue
-        if _target_sets_overlap(ctxt["intended_claims"], targets):
+        if _has_overlap(ctxt["intended_claims"], targets):
             competitors.append({
                 "claim_file": str(claim_path),
                 "claim": claim,
-                "remaining_seconds": _remaining_seconds(expiry),
+                "remaining_seconds": _remaining_lease(expiry),
             })
     return {"status": OK, "competing_claims": competitors, "diagnostics": diagnostics}
 
 
-def _read_own_relevant_claims(ctxt: dict[str, Any]) -> list[dict[str, Any]]:
+def _read_claims(ctxt: dict[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for record in ctxt["published_claims"]:
         try:
-            claim = _read_claim_file(Path(record["claim_file"]))
+            claim = _read_claim(Path(record["claim_file"]))
             expiry = _claim_expiry(claim)
             targets = _claim_targets(claim)
         except (OSError, ValueError, json.JSONDecodeError):
             continue
         if claim.get("session_guid") != ctxt["session_guid"] or expiry is None or targets is None:
             continue
-        if expiry > _now() and _target_sets_overlap(ctxt["intended_claims"], targets):
+        if expiry > _now() and _has_overlap(ctxt["intended_claims"], targets):
             copied = dict(record)
             copied["expires_at"] = _format_time(expiry)
             records.append(copied)
     return records
 
 
-def _read_claim_file(claim_path: Path) -> dict[str, Any]:
+def _read_claim(claim_path: Path) -> dict[str, Any]:
     claim = json.loads(claim_path.read_text(encoding="utf-8"))
     if not isinstance(claim, dict):
         raise ValueError("claim document is not an object")
@@ -404,23 +463,23 @@ def _normalize_target(claim: tuple[str, str]) -> tuple[str, str]:
     return scope, normalized
 
 
-def _target_sets_overlap(left: list[tuple[str, str]], right: list[tuple[str, str]]) -> bool:
-    return any(_targets_overlap(first, second) for first in left for second in right)
+def _has_overlap(left: list[tuple[str, str]], right: list[tuple[str, str]]) -> bool:
+    return any(_is_one_target_overlapping_another(first, second) for first in left for second in right)
 
 
-def _targets_overlap(left: tuple[str, str], right: tuple[str, str]) -> bool:
+def _is_one_target_overlapping_another(left: tuple[str, str], right: tuple[str, str]) -> bool:
     left_scope, left_path = left
     right_scope, right_path = right
     if left_scope == TREE and right_scope == TREE:
-        return _is_same_or_beneath(left_path, right_path) or _is_same_or_beneath(right_path, left_path)
+        return _is_below(left_path, right_path) or _is_below(right_path, left_path)
     if left_scope == TREE:
-        return _is_same_or_beneath(right_path, left_path)
+        return _is_below(right_path, left_path)
     if right_scope == TREE:
-        return _is_same_or_beneath(left_path, right_path)
+        return _is_below(left_path, right_path)
     return left_path == right_path
 
 
-def _is_same_or_beneath(path: str, root: str) -> bool:
+def _is_below(path: str, root: str) -> bool:
     try:
         return os.path.commonpath((path, root)) == root
     except ValueError:
@@ -444,7 +503,7 @@ def _write_immutable_claim(claim_path: Path, claim: dict[str, Any]) -> None:
         raise
 
 
-def _get_claim_registry() -> Path:
+def _get_registry() -> Path:
     if g["registry_path"] is None:
         g["registry_path"] = Path(machineroot.get("fair-play")) / "claims"
     registry = Path(g["registry_path"])
@@ -452,16 +511,16 @@ def _get_claim_registry() -> Path:
     return registry
 
 
-def _wait_and_check_for_claim_acquisition(ctxt: dict[str, Any], lease_seconds: float, flags: list[str], started_at: float, retries: int) -> dict[str, Any]:
-    check_flags = [flag for flag in flags if flag in {"block", "auto-retry"}]
-    return _check_competitors_until_decisive(ctxt, 0, check_flags, started_at, retries)
+def _wait_and_check_for_claim_acquisition(ctxt: dict[str, Any], flags: list[str] | None = None) -> dict[str, Any]:
+    check_flags = [flag for flag in flags or [] if flag in {"block", "auto-retry"}]
+    return _check_competitors(ctxt, 0, check_flags)
 
 
-def _may_retry_acquisition(retries: int, ctxt: dict[str, Any], started_at: float) -> bool:
+def _may_retry_this_claim_acquisition(ctxt: dict[str, Any]) -> bool:
     limit = ctxt["config"]["retry_max_attempts"]
-    if _block_has_timed_out(ctxt, started_at):
+    if _is_block_expired(ctxt):
         return False
-    return limit is None or retries < limit
+    return limit is None or ctxt["acquisition_retry_count"] < limit
 
 
 def _sleep_for_acquisition_retry(ctxt: dict[str, Any]) -> None:
@@ -469,46 +528,71 @@ def _sleep_for_acquisition_retry(ctxt: dict[str, Any]) -> None:
     _sleep_ms(delay)
 
 
-def _sleep_until_contention_window_or_timeout(ctxt: dict[str, Any], started_at: float) -> None:
+def _sleep_until_contention_window_or_timeout(ctxt: dict[str, Any]) -> None:
     ends_at = _parse_time(ctxt["contention_window_ends_at"])
     seconds = max(0.0, (ends_at - _now()).total_seconds())
     timeout = ctxt["config"]["block_timeout_seconds"]
     if timeout is not None:
-        seconds = min(seconds, max(0.0, timeout - (time.monotonic() - started_at)))
+        seconds = min(seconds, max(0.0, timeout - (time.monotonic() - ctxt["block_started_at"])))
     time.sleep(seconds)
 
 
-def _block_has_timed_out(ctxt: dict[str, Any], started_at: float) -> bool:
+def _is_block_expired(ctxt: dict[str, Any]) -> bool:
     timeout = ctxt["config"]["block_timeout_seconds"]
-    return timeout is not None and time.monotonic() - started_at >= timeout
+    return timeout is not None and time.monotonic() - ctxt["block_started_at"] >= timeout
 
 
-def _minimum_remaining_seconds(records: list[dict[str, Any]]) -> float | None:
+def _lease_time(records: list[dict[str, Any]]) -> float | None:
     if not records:
         return None
     return min(max(0.0, (_parse_time(record["expires_at"]) - _now()).total_seconds()) for record in records)
 
 
-def _remaining_seconds(expires_at: datetime) -> int:
+def _remaining_lease(expires_at: datetime) -> int:
     return max(0, math.ceil((expires_at - _now()).total_seconds()))
 
 
-def _result(function: str, status: str, ctxt: dict[str, Any] | None, **extra: Any) -> dict[str, Any]:
-    result = {
-        "status": status,
+def _prepare_result(ctxt: dict[str, Any], function: str) -> None:
+    ctxt["result"] = {
+        "status": None,
         "function": function,
-        "timestamp": _format_time(_now()),
+        "timestamp": None,
         "session_guid": process["session_guid"],
-        "operation_guid": ctxt["operation_guid"] if ctxt else None,
-        "own_claims": _own_claim_summaries(ctxt),
-        "remaining_seconds": _minimum_remaining_seconds(_read_own_relevant_claims(ctxt)) if ctxt else None,
-        "competing_claims": list(ctxt["last_competing_claims"]) if ctxt else [],
-        "retry": _retry_details(0, ctxt, False),
+        "operation_guid": ctxt["operation_guid"],
+        "own_claims": [],
+        "remaining_seconds": None,
+        "competing_claims": [],
+        "retry": _retry_details(ctxt),
         "diagnostics": [],
     }
-    result.update(extra)
-    if ctxt is not None:
-        ctxt["last_result"] = status
+
+
+def _set_status(ctxt: dict[str, Any], status: str) -> None:
+    if ctxt["result"] is None:
+        raise RuntimeError("a result must be prepared before its status is set")
+    ctxt["result"]["status"] = status
+    ctxt["last_result"] = status
+
+
+def _update_result(ctxt: dict[str, Any], details: dict[str, Any]) -> None:
+    if ctxt["result"] is None:
+        raise RuntimeError("a result must be prepared before it is updated")
+    ctxt["result"].update(details)
+
+
+def _return_result(ctxt: dict[str, Any]) -> dict[str, Any]:
+    result = ctxt["result"]
+    if result is None or result["status"] is None:
+        raise RuntimeError("a result must be prepared and given a status before return")
+    result["timestamp"] = _format_time(_now())
+    result["own_claims"] = _own_claim_summaries(ctxt)
+    result["remaining_seconds"] = _lease_time(_read_claims(ctxt))
+    result["competing_claims"] = list(ctxt["last_competing_claims"])
+    for claim in result["competing_claims"]:
+        expiry = _claim_expiry(claim["claim"])
+        if expiry is not None:
+            claim["remaining_seconds"] = _remaining_lease(expiry)
+    ctxt["result"] = None
     return result
 
 
@@ -517,16 +601,16 @@ def _own_claim_summaries(ctxt: dict[str, Any] | None) -> list[dict[str, Any]]:
         return []
     return [
         {key: record[key] for key in ("claim_guid", "claim_file", "expires_at")}
-        for record in _read_own_relevant_claims(ctxt)
+        for record in _read_claims(ctxt)
     ]
 
 
-def _retry_details(acquisition_retries: int, ctxt: dict[str, Any] | None, will_retry: bool, auto_retries: int = 0) -> dict[str, Any]:
+def _retry_details(ctxt: dict[str, Any] | None, auto_retries: int = 0) -> dict[str, Any]:
     return {
         "auto_retry_attempts": auto_retries,
-        "acquisition_retry_attempts": acquisition_retries,
+        "acquisition_retry_attempts": ctxt["acquisition_retry_count"] if ctxt else 0,
         "max_attempts": ctxt["config"]["retry_max_attempts"] if ctxt else None,
-        "will_retry": will_retry,
+        "will_retry": False,
     }
 
 
@@ -550,7 +634,7 @@ def _validate_config(values: dict[str, Any]) -> None:
     if not isinstance(values, dict) or set(values) != required:
         raise FairPlayConfigurationError("config must contain exactly the specified Fair Play keys")
     for name in ("minimum_reup_seconds", "retry_wait_interval_ms", "retry_jitter_ms"):
-        _validate_nonnegative_number(values[name], name)
+        _validate_nonnegative(values[name], name)
     if values["minimum_reup_seconds"] <= 0:
         raise FairPlayConfigurationError("minimum_reup_seconds must be positive")
     for name in ("auto_retry_max_attempts", "auto_retry_wait_interval_ms"):
@@ -560,7 +644,7 @@ def _validate_config(values: dict[str, Any]) -> None:
         raise FairPlayConfigurationError("retry_max_attempts must be a non-negative integer or None")
     timeout = values["block_timeout_seconds"]
     if timeout is not None:
-        _validate_positive_number(timeout, "block_timeout_seconds")
+        _validate_number(timeout, "block_timeout_seconds")
 
 
 def _validate_flags(flags: list[str] | None, allowed: set[str]) -> list[str]:
@@ -571,18 +655,18 @@ def _validate_flags(flags: list[str] | None, allowed: set[str]) -> list[str]:
     return list(flags)
 
 
-def _validate_positive_number(value: Any, name: str) -> None:
+def _validate_number(value: Any, name: str) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be a positive finite number")
 
 
-def _validate_nonnegative_number(value: Any, name: str) -> None:
+def _validate_nonnegative(value: Any, name: str) -> None:
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or value < 0:
         raise FairPlayConfigurationError(f"{name} must be a non-negative finite number")
 
 
 def _normalize_expected_seconds(value: Any) -> int:
-    _validate_nonnegative_number(value, "expected_seconds")
+    _validate_nonnegative(value, "expected_seconds")
     return math.ceil(value)
 
 

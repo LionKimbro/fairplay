@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 dependencies = ["machine-root"]
 license = { file = "LICENSE" }
 
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
 [tool.setuptools]
 package-dir = { "" = "src" }
 
